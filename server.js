@@ -15,223 +15,100 @@ const HF_API_KEY = process.env.HF_API_KEY;
 const HF_MODEL = 'deepseek-ai/DeepSeek-R1-0528';
 const HF_API_URL = `https://router.huggingface.cc/models/${HF_MODEL}`;
 
-// 🔥 REASONING DISPLAY TOGGLE
-const SHOW_REASONING = false; // Set to false to hide <think> tags
-
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     service: 'Hugging Face DeepSeek R1 Proxy',
-    model: HF_MODEL,
-    reasoning_display: SHOW_REASONING
+    model: HF_MODEL
   });
 });
 
-// List models endpoint (OpenAI compatible)
+// List models endpoint
 app.get('/v1/models', (req, res) => {
   res.json({
     object: 'list',
-    data: [
-      {
-        id: 'deepseek-r1',
-        object: 'model',
-        created: Date.now(),
-        owned_by: 'huggingface'
-      },
-      {
-        id: 'gpt-4',
-        object: 'model',
-        created: Date.now(),
-        owned_by: 'huggingface'
-      }
-    ]
+    data: [{ id: 'deepseek-r1', object: 'model', created: Date.now(), owned_by: 'hf' }]
   });
 });
 
-// Helper function to convert messages to prompt
+// Helper function
 function messagesToPrompt(messages) {
   let prompt = '';
   for (const msg of messages) {
-    if (msg.role === 'system') {
-      prompt += `System: ${msg.content}\n\n`;
-    } else if (msg.role === 'user') {
-      prompt += `User: ${msg.content}\n\n`;
-    } else if (msg.role === 'assistant') {
-      prompt += `Assistant: ${msg.content}\n\n`;
-    }
+    if (msg.role === 'system') prompt += `System: ${msg.content}\n\n`;
+    else if (msg.role === 'user') prompt += `User: ${msg.content}\n\n`;
+    else if (msg.role === 'assistant') prompt += `Assistant: ${msg.content}\n\n`;
   }
   prompt += 'Assistant:';
   return prompt;
 }
 
-// Helper function to parse thinking tags
-function parseResponse(text) {
-  if (!SHOW_REASONING) {
-    // Remove thinking tags and content
-    text = text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-  }
-  return text;
-}
+// Main chat endpoint - ALL POSSIBLE ROUTES
+app.post('/v1/chat/completions', handleChat);
+app.post('/chat/completions', handleChat);
 
-// Chat completions endpoint (main proxy)
-app.post('/v1/chat/completions', async (req, res) => {
+async function handleChat(req, res) {
+  console.log('=== RECEIVED REQUEST ===');
+  console.log('Path:', req.path);
+  console.log('Body:', JSON.stringify(req.body, null, 2));
+  
   try {
-    const { messages, temperature, max_tokens, stream } = req.body;
+    const { messages, max_tokens = 1024 } = req.body;
     
     if (!HF_API_KEY) {
-      return res.status(500).json({
-        error: {
-          message: 'HF_API_KEY not configured',
-          type: 'configuration_error',
-          code: 500
-        }
-      });
+      return res.status(500).json({ error: { message: 'HF_API_KEY not set' } });
     }
 
-    // Convert messages to prompt format
     const prompt = messagesToPrompt(messages);
     
-    // Prepare request to Hugging Face
-    const hfRequest = {
+    console.log('Calling Hugging Face DeepSeek R1...');
+    const response = await axios.post(HF_API_URL, {
       inputs: prompt,
       parameters: {
-        max_new_tokens: max_tokens || 2048,
-        temperature: temperature || 0.7,
-        top_p: 0.95,
-        do_sample: true,
+        max_new_tokens: max_tokens,
+        temperature: 0.7,
         return_full_text: false
       },
-      options: {
-        use_cache: false,
-        wait_for_model: true
-      }
-    };
+      options: { wait_for_model: true }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${HF_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 120000 // 2 minutes for DeepSeek
+    });
 
-    if (stream) {
-      // Streaming response
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
+    console.log('Got response from HF');
+    const text = response.data[0]?.generated_text || 'No response';
 
-      try {
-        const response = await axios.post(HF_API_URL, hfRequest, {
-          headers: {
-            'Authorization': `Bearer ${HF_API_KEY}`,
-            'Content-Type': 'application/json'
-          }
-        });
-
-        const generatedText = response.data[0]?.generated_text || '';
-        const parsedText = parseResponse(generatedText);
-        
-        // Split into chunks for streaming
-        const words = parsedText.split(' ');
-        for (let i = 0; i < words.length; i++) {
-          const chunk = {
-            id: `chatcmpl-${Date.now()}`,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: 'deepseek-r1',
-            choices: [{
-              index: 0,
-              delta: {
-                content: words[i] + (i < words.length - 1 ? ' ' : '')
-              },
-              finish_reason: i === words.length - 1 ? 'stop' : null
-            }]
-          };
-          
-          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-          
-          // Small delay for streaming effect
-          await new Promise(resolve => setTimeout(resolve, 30));
-        }
-        
-        res.write('data: [DONE]\n\n');
-        res.end();
-
-      } catch (error) {
-        console.error('Streaming error:', error.message);
-        res.write(`data: {"error": "${error.message}"}\n\n`);
-        res.end();
-      }
-
-    } else {
-      // Non-streaming response
-      const response = await axios.post(HF_API_URL, hfRequest, {
-        headers: {
-          'Authorization': `Bearer ${HF_API_KEY}`,
-          'Content-Type': 'application/json'
-        }
-      });
-
-      const generatedText = response.data[0]?.generated_text || '';
-      const parsedText = parseResponse(generatedText);
-
-      const openaiResponse = {
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: 'deepseek-r1',
-        choices: [{
-          index: 0,
-          message: {
-            role: 'assistant',
-            content: parsedText
-          },
-          finish_reason: 'stop'
-        }],
-        usage: {
-          prompt_tokens: prompt.split(' ').length,
-          completion_tokens: parsedText.split(' ').length,
-          total_tokens: prompt.split(' ').length + parsedText.split(' ').length
-        }
-      };
-
-      res.json(openaiResponse);
-    }
+    res.json({
+      id: 'chatcmpl-' + Date.now(),
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: 'deepseek-r1',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: text },
+        finish_reason: 'stop'
+      }]
+    });
     
   } catch (error) {
-    console.error('Proxy error:', error.response?.data || error.message);
-    
-    let errorMessage = 'Internal server error';
-    let statusCode = 500;
-    
-    if (error.response?.status === 503) {
-      errorMessage = 'Model is loading, please try again in a moment';
-      statusCode = 503;
-    } else if (error.response?.status === 429) {
-      errorMessage = 'Rate limit exceeded, please try again later';
-      statusCode = 429;
-    } else if (error.response?.data) {
-      errorMessage = error.response.data.error || errorMessage;
-    }
-    
-    res.status(statusCode).json({
-      error: {
-        message: errorMessage,
-        type: 'api_error',
-        code: statusCode
-      }
+    console.error('ERROR:', error.message);
+    console.error('Full error:', error.response?.data);
+    res.status(500).json({
+      error: { message: error.response?.data?.error || error.message }
     });
   }
-});
+}
 
-// Catch-all for unsupported endpoints
+// Catch all
 app.all('*', (req, res) => {
-  res.status(404).json({
-    error: {
-      message: `Endpoint ${req.path} not found`,
-      type: 'invalid_request_error',
-      code: 404
-    }
-  });
+  console.log('Unknown path:', req.method, req.path);
+  res.status(404).json({ error: { message: `Path ${req.path} not found` } });
 });
 
 app.listen(PORT, () => {
-  console.log(`Hugging Face DeepSeek R1 Proxy running on port ${PORT}`);
-  console.log(`Model: ${HF_MODEL}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`DeepSeek R1 Proxy running on port ${PORT}`);
 });
