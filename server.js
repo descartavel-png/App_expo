@@ -12,130 +12,265 @@ app.use(express.json());
 
 // Hugging Face configuration
 const HF_API_KEY = process.env.HF_API_KEY;
-const HF_MODEL = 'deepseek-ai/DeepSeek-R1-0528';
+const HF_MODEL = 'meta-llama/Llama-3.2-3B-Instruct'; // Faster model for testing
 const HF_API_URL = `https://router.huggingface.cc/models/${HF_MODEL}`;
+
+// 🔥 REASONING DISPLAY TOGGLE
+const SHOW_REASONING = false; // Disabled for faster model
 
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     service: 'Hugging Face DeepSeek R1 Proxy',
-    model: HF_MODEL
+    model: HF_MODEL,
+    reasoning_display: SHOW_REASONING
   });
 });
 
-// List models endpoint
+// List models endpoint (OpenAI compatible)
 app.get('/v1/models', (req, res) => {
   res.json({
     object: 'list',
-    data: [{ id: 'deepseek-r1', object: 'model', created: Date.now(), owned_by: 'hf' }]
+    data: [
+      {
+        id: 'deepseek-r1',
+        object: 'model',
+        created: Date.now(),
+        owned_by: 'huggingface'
+      },
+      {
+        id: 'gpt-4',
+        object: 'model',
+        created: Date.now(),
+        owned_by: 'huggingface'
+      }
+    ]
   });
 });
 
-// Helper function
+// Helper function to convert messages to prompt
 function messagesToPrompt(messages) {
   let prompt = '';
   for (const msg of messages) {
-    if (msg.role === 'system') prompt += `${msg.content}\n\n`;
-    else if (msg.role === 'user') prompt += `User: ${msg.content}\n\n`;
-    else if (msg.role === 'assistant') prompt += `Assistant: ${msg.content}\n\n`;
+    if (msg.role === 'system') {
+      prompt += `System: ${msg.content}\n\n`;
+    } else if (msg.role === 'user') {
+      prompt += `User: ${msg.content}\n\n`;
+    } else if (msg.role === 'assistant') {
+      prompt += `Assistant: ${msg.content}\n\n`;
+    }
   }
   prompt += 'Assistant:';
   return prompt;
 }
 
-// Main chat endpoint
-app.post('/v1/chat/completions', handleChat);
-app.post('/chat/completions', handleChat);
+// Helper function to parse thinking tags
+function parseResponse(text) {
+  if (!SHOW_REASONING) {
+    // Remove thinking tags and content
+    text = text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+  }
+  return text;
+}
 
-async function handleChat(req, res) {
-  console.log('=== RECEIVED REQUEST ===');
-  console.log('Path:', req.path);
-  
+// Chat completions endpoint (main proxy) - Multiple route versions
+app.post('/v1/chat/completions', handleChatCompletion);
+app.post('/chat/completions', handleChatCompletion);
+app.post('/completions', handleChatCompletion);
+
+async function handleChatCompletion(req, res) {
   try {
-    const { messages, max_tokens = 1024 } = req.body;
+    const { messages, temperature, max_tokens, stream } = req.body;
     
     if (!HF_API_KEY) {
-      return res.status(500).json({ error: { message: 'HF_API_KEY not set' } });
+      return res.status(500).json({
+        error: {
+          message: 'HF_API_KEY not configured',
+          type: 'configuration_error',
+          code: 500
+        }
+      });
     }
 
+    // Convert messages to prompt format
     const prompt = messagesToPrompt(messages);
-    console.log('Prompt:', prompt);
     
-    console.log('Calling Hugging Face DeepSeek R1...');
-    const response = await axios.post(HF_API_URL, {
+    // Prepare request to Hugging Face
+    const hfRequest = {
       inputs: prompt,
       parameters: {
-        max_new_tokens: max_tokens,
-        temperature: 0.7,
-        top_p: 0.9,
+        max_new_tokens: max_tokens || 1024,
+        temperature: temperature || 0.7,
+        top_p: 0.95,
         do_sample: true,
         return_full_text: false
       },
-      options: { 
-        wait_for_model: true,
-        use_cache: false
+      options: {
+        use_cache: false,
+        wait_for_model: true
       }
-    }, {
-      headers: {
-        'Authorization': `Bearer ${HF_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 120000
-    });
+    };
 
-    console.log('Got response from HF');
-    console.log('Full HF response:', JSON.stringify(response.data, null, 2));
-    
-    // Handle different response formats
-    let text = '';
-    
-    if (Array.isArray(response.data)) {
-      // Format: [{ generated_text: "..." }]
-      text = response.data[0]?.generated_text || '';
-    } else if (response.data.generated_text) {
-      // Format: { generated_text: "..." }
-      text = response.data.generated_text;
-    } else if (typeof response.data === 'string') {
-      // Format: "plain text"
-      text = response.data;
-    }
-    
-    console.log('Extracted text:', text);
-    
-    if (!text || text.trim() === '') {
-      text = 'I apologize, but I was unable to generate a response. Please try again.';
-    }
+    if (stream) {
+      // Streaming response - send immediate response to prevent timeout
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
 
-    res.json({
-      id: 'chatcmpl-' + Date.now(),
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: 'deepseek-r1',
-      choices: [{
-        index: 0,
-        message: { role: 'assistant', content: text },
-        finish_reason: 'stop'
-      }]
-    });
+      // Send immediate chunk to keep connection alive
+      const keepAliveChunk = {
+        id: `chatcmpl-${Date.now()}`,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: 'deepseek-r1',
+        choices: [{
+          index: 0,
+          delta: { content: '' },
+          finish_reason: null
+        }]
+      };
+      res.write(`data: ${JSON.stringify(keepAliveChunk)}\n\n`);
+
+      try {
+        const response = await axios.post(HF_API_URL, hfRequest, {
+          headers: {
+            'Authorization': `Bearer ${HF_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 90000
+        });
+
+        const generatedText = response.data[0]?.generated_text || '';
+        const parsedText = parseResponse(generatedText);
+        
+        // Split into chunks for streaming
+        const words = parsedText.split(' ');
+        for (let i = 0; i < words.length; i++) {
+          const chunk = {
+            id: `chatcmpl-${Date.now()}`,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: 'deepseek-r1',
+            choices: [{
+              index: 0,
+              delta: {
+                content: words[i] + (i < words.length - 1 ? ' ' : '')
+              },
+              finish_reason: i === words.length - 1 ? 'stop' : null
+            }]
+          };
+          
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          
+          // Small delay for streaming effect
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        
+        res.write('data: [DONE]\n\n');
+        res.end();
+
+      } catch (error) {
+        console.error('Streaming error:', error.message);
+        
+        // Send error as stream
+        const errorChunk = {
+          id: `chatcmpl-${Date.now()}`,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: 'deepseek-r1',
+          choices: [{
+            index: 0,
+            delta: {
+              content: `[Error: ${error.response?.data?.error || error.message}. Please try again.]`
+            },
+            finish_reason: 'stop'
+          }]
+        };
+        res.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+
+    } else {
+      // Non-streaming response
+      const response = await axios.post(HF_API_URL, hfRequest, {
+        headers: {
+          'Authorization': `Bearer ${HF_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 90000
+      });
+
+      const generatedText = response.data[0]?.generated_text || '';
+      const parsedText = parseResponse(generatedText);
+
+      const openaiResponse = {
+        id: `chatcmpl-${Date.now()}`,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: 'deepseek-r1',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: parsedText
+          },
+          finish_reason: 'stop'
+        }],
+        usage: {
+          prompt_tokens: prompt.split(' ').length,
+          completion_tokens: parsedText.split(' ').length,
+          total_tokens: prompt.split(' ').length + parsedText.split(' ').length
+        }
+      };
+
+      res.json(openaiResponse);
+    }
     
   } catch (error) {
-    console.error('ERROR:', error.message);
-    if (error.response) {
-      console.error('Error response:', JSON.stringify(error.response.data, null, 2));
+    console.error('Proxy error:', error.response?.data || error.message);
+    
+    let errorMessage = 'Internal server error';
+    let statusCode = 500;
+    
+    if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
+      errorMessage = 'Request timeout - model is loading or service is slow. Please try again.';
+      statusCode = 504;
+    } else if (error.response?.status === 503) {
+      errorMessage = 'Model is loading, please wait 30 seconds and try again';
+      statusCode = 503;
+    } else if (error.response?.status === 429) {
+      errorMessage = 'Rate limit exceeded, please try again later';
+      statusCode = 429;
+    } else if (error.response?.data) {
+      errorMessage = JSON.stringify(error.response.data);
     }
-    res.status(500).json({
-      error: { message: error.response?.data?.error || error.message }
+    
+    res.status(statusCode).json({
+      error: {
+        message: errorMessage,
+        type: 'api_error',
+        code: statusCode
+      }
     });
   }
 }
 
-// Catch all
+// Catch-all for unsupported endpoints
 app.all('*', (req, res) => {
-  console.log('Unknown path:', req.method, req.path);
-  res.status(404).json({ error: { message: `Path ${req.path} not found` } });
+  res.status(404).json({
+    error: {
+      message: `Endpoint ${req.path} not found`,
+      type: 'invalid_request_error',
+      code: 404
+    }
+  });
 });
 
 app.listen(PORT, () => {
-  console.log(`DeepSeek R1 Proxy running on port ${PORT}`);
+  console.log(`Hugging Face DeepSeek R1 Proxy running on port ${PORT}`);
+  console.log(`Model: ${HF_MODEL}`);
+  console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
 });
