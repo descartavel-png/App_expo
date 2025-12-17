@@ -36,7 +36,7 @@ app.get('/v1/models', (req, res) => {
 function messagesToPrompt(messages) {
   let prompt = '';
   for (const msg of messages) {
-    if (msg.role === 'system') prompt += `System: ${msg.content}\n\n`;
+    if (msg.role === 'system') prompt += `${msg.content}\n\n`;
     else if (msg.role === 'user') prompt += `User: ${msg.content}\n\n`;
     else if (msg.role === 'assistant') prompt += `Assistant: ${msg.content}\n\n`;
   }
@@ -44,14 +44,13 @@ function messagesToPrompt(messages) {
   return prompt;
 }
 
-// Main chat endpoint - ALL POSSIBLE ROUTES
+// Main chat endpoint
 app.post('/v1/chat/completions', handleChat);
 app.post('/chat/completions', handleChat);
 
 async function handleChat(req, res) {
   console.log('=== RECEIVED REQUEST ===');
   console.log('Path:', req.path);
-  console.log('Body:', JSON.stringify(req.body, null, 2));
   
   try {
     const { messages, max_tokens = 1024 } = req.body;
@@ -61,6 +60,7 @@ async function handleChat(req, res) {
     }
 
     const prompt = messagesToPrompt(messages);
+    console.log('Prompt:', prompt);
     
     console.log('Calling Hugging Face DeepSeek R1...');
     const response = await axios.post(HF_API_URL, {
@@ -68,19 +68,44 @@ async function handleChat(req, res) {
       parameters: {
         max_new_tokens: max_tokens,
         temperature: 0.7,
+        top_p: 0.9,
+        do_sample: true,
         return_full_text: false
       },
-      options: { wait_for_model: true }
+      options: { 
+        wait_for_model: true,
+        use_cache: false
+      }
     }, {
       headers: {
         'Authorization': `Bearer ${HF_API_KEY}`,
         'Content-Type': 'application/json'
       },
-      timeout: 120000 // 2 minutes for DeepSeek
+      timeout: 120000
     });
 
     console.log('Got response from HF');
-    const text = response.data[0]?.generated_text || 'No response';
+    console.log('Full HF response:', JSON.stringify(response.data, null, 2));
+    
+    // Handle different response formats
+    let text = '';
+    
+    if (Array.isArray(response.data)) {
+      // Format: [{ generated_text: "..." }]
+      text = response.data[0]?.generated_text || '';
+    } else if (response.data.generated_text) {
+      // Format: { generated_text: "..." }
+      text = response.data.generated_text;
+    } else if (typeof response.data === 'string') {
+      // Format: "plain text"
+      text = response.data;
+    }
+    
+    console.log('Extracted text:', text);
+    
+    if (!text || text.trim() === '') {
+      text = 'I apologize, but I was unable to generate a response. Please try again.';
+    }
 
     res.json({
       id: 'chatcmpl-' + Date.now(),
@@ -96,7 +121,9 @@ async function handleChat(req, res) {
     
   } catch (error) {
     console.error('ERROR:', error.message);
-    console.error('Full error:', error.response?.data);
+    if (error.response) {
+      console.error('Error response:', JSON.stringify(error.response.data, null, 2));
+    }
     res.status(500).json({
       error: { message: error.response?.data?.error || error.message }
     });
