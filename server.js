@@ -12,7 +12,7 @@ app.use(express.json());
 
 // Hugging Face configuration
 const HF_API_KEY = process.env.HF_API_KEY;
-const HF_MODEL = 'deepseek-ai/DeepSeek-R1-0528';
+const HF_MODEL = 'deepseek-ai/DeepSeek-R1';
 const HF_API_URL = `https://router.huggingface.co/models/${HF_MODEL}`;
 
 // 🔥 REASONING DISPLAY TOGGLE
