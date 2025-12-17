@@ -16,7 +16,7 @@ const HF_MODEL = 'deepseek-ai/DeepSeek-R1-0528';
 const HF_API_URL = `https://router.huggingface.co/models/${HF_MODEL}`;
 
 // 🔥 REASONING DISPLAY TOGGLE
-const SHOW_REASONING = true; // Set to false to hide <think> tags
+const SHOW_REASONING = false; // Set to false to hide <think> tags
 
 // Health check endpoint
 app.get('/health', (req, res) => {
