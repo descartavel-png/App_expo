@@ -12,11 +12,11 @@ app.use(express.json());
 
 // Hugging Face configuration
 const HF_API_KEY = process.env.HF_API_KEY;
-const HF_MODEL = 'meta-llama/Llama-3.2-3B-Instruct'; // Faster model for testing
-const HF_API_URL = `https://router.huggingface.cc/models/${HF_MODEL}`;
+const HF_MODEL = 'deepseek-ai/DeepSeek-R1-0528';
+const HF_API_URL = `https://api-inference.huggingface.co/models/${HF_MODEL}`;
 
 // 🔥 REASONING DISPLAY TOGGLE
-const SHOW_REASONING = false; // Disabled for faster model
+const SHOW_REASONING = true; // Set to false to hide <think> tags
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -74,12 +74,8 @@ function parseResponse(text) {
   return text;
 }
 
-// Chat completions endpoint (main proxy) - Multiple route versions
-app.post('/v1/chat/completions', handleChatCompletion);
-app.post('/chat/completions', handleChatCompletion);
-app.post('/completions', handleChatCompletion);
-
-async function handleChatCompletion(req, res) {
+// Chat completions endpoint (main proxy)
+app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { messages, temperature, max_tokens, stream } = req.body;
     
@@ -100,7 +96,7 @@ async function handleChatCompletion(req, res) {
     const hfRequest = {
       inputs: prompt,
       parameters: {
-        max_new_tokens: max_tokens || 1024,
+        max_new_tokens: max_tokens || 2048,
         temperature: temperature || 0.7,
         top_p: 0.95,
         do_sample: true,
@@ -113,32 +109,17 @@ async function handleChatCompletion(req, res) {
     };
 
     if (stream) {
-      // Streaming response - send immediate response to prevent timeout
+      // Streaming response
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-
-      // Send immediate chunk to keep connection alive
-      const keepAliveChunk = {
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: 'deepseek-r1',
-        choices: [{
-          index: 0,
-          delta: { content: '' },
-          finish_reason: null
-        }]
-      };
-      res.write(`data: ${JSON.stringify(keepAliveChunk)}\n\n`);
 
       try {
         const response = await axios.post(HF_API_URL, hfRequest, {
           headers: {
             'Authorization': `Bearer ${HF_API_KEY}`,
             'Content-Type': 'application/json'
-          },
-          timeout: 90000
+          }
         });
 
         const generatedText = response.data[0]?.generated_text || '';
@@ -164,7 +145,7 @@ async function handleChatCompletion(req, res) {
           res.write(`data: ${JSON.stringify(chunk)}\n\n`);
           
           // Small delay for streaming effect
-          await new Promise(resolve => setTimeout(resolve, 20));
+          await new Promise(resolve => setTimeout(resolve, 30));
         }
         
         res.write('data: [DONE]\n\n');
@@ -172,23 +153,7 @@ async function handleChatCompletion(req, res) {
 
       } catch (error) {
         console.error('Streaming error:', error.message);
-        
-        // Send error as stream
-        const errorChunk = {
-          id: `chatcmpl-${Date.now()}`,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: 'deepseek-r1',
-          choices: [{
-            index: 0,
-            delta: {
-              content: `[Error: ${error.response?.data?.error || error.message}. Please try again.]`
-            },
-            finish_reason: 'stop'
-          }]
-        };
-        res.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
-        res.write('data: [DONE]\n\n');
+        res.write(`data: {"error": "${error.message}"}\n\n`);
         res.end();
       }
 
@@ -198,8 +163,7 @@ async function handleChatCompletion(req, res) {
         headers: {
           'Authorization': `Bearer ${HF_API_KEY}`,
           'Content-Type': 'application/json'
-        },
-        timeout: 90000
+        }
       });
 
       const generatedText = response.data[0]?.generated_text || '';
@@ -234,17 +198,14 @@ async function handleChatCompletion(req, res) {
     let errorMessage = 'Internal server error';
     let statusCode = 500;
     
-    if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-      errorMessage = 'Request timeout - model is loading or service is slow. Please try again.';
-      statusCode = 504;
-    } else if (error.response?.status === 503) {
-      errorMessage = 'Model is loading, please wait 30 seconds and try again';
+    if (error.response?.status === 503) {
+      errorMessage = 'Model is loading, please try again in a moment';
       statusCode = 503;
     } else if (error.response?.status === 429) {
       errorMessage = 'Rate limit exceeded, please try again later';
       statusCode = 429;
     } else if (error.response?.data) {
-      errorMessage = JSON.stringify(error.response.data);
+      errorMessage = error.response.data.error || errorMessage;
     }
     
     res.status(statusCode).json({
@@ -255,7 +216,7 @@ async function handleChatCompletion(req, res) {
       }
     });
   }
-}
+});
 
 // Catch-all for unsupported endpoints
 app.all('*', (req, res) => {
