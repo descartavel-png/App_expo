@@ -98,7 +98,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       // Keep messages that fit within ~24,000 tokens (~96,000 characters)
 messages: (() => {
   let charCount = 0;
-  const maxChars = 280000; // ~24k tokens
+  const maxChars = 150000; // ~24k tokens
   const kept = [];
   
   // Always keep first message (character card)
